@@ -470,12 +470,10 @@
 <script>
   // ---------- GITHUB / FORMS BACKEND ----------
   // Replace this with your deployed Google Apps Script Web App URL.
-  const FORMS_API_URL = 'PASTE_YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE';
-  // Change this value in BOTH this file and Code.gs before deployment.
-  const FORMS_ADMIN_KEY = 'CHANGE_THIS_ADMIN_KEY_9f4d2b7c';
+  const FORMS_API_URL = 'https://formspree.io/f/mqpzgdya';
 
   function backendConfigured() {
-    return FORMS_API_URL && !FORMS_API_URL.includes('PASTE_YOUR_');
+    return FORMS_API_URL === 'https://formspree.io/f/mqpzgdya';
   }
 
   function jsonp(action, params = {}) {
@@ -493,31 +491,28 @@
     });
   }
 
-  function postToBackend(fields) {
-    return new Promise((resolve, reject) => {
-      if (!backendConfigured()) return reject(new Error('Forms backend is not configured.'));
-      const iframeName = 'forms_submit_' + Date.now();
-      const iframe = document.createElement('iframe');
-      iframe.name = iframeName;
-      iframe.style.display = 'none';
-      document.body.appendChild(iframe);
-      const form = document.createElement('form');
-      form.method = 'POST';
-      form.action = FORMS_API_URL;
-      form.target = iframeName;
-      form.style.display = 'none';
-      Object.entries(fields).forEach(([key, value]) => {
-        const input = document.createElement('input');
-        input.type = 'hidden'; input.name = key; input.value = value == null ? '' : String(value);
-        form.appendChild(input);
-      });
-      document.body.appendChild(form);
-      let settled = false;
-      const finish = (ok) => { if (settled) return; settled = true; setTimeout(() => { form.remove(); iframe.remove(); }, 500); ok ? resolve(true) : reject(new Error('Backend submission failed.')); };
-      iframe.onload = () => finish(true);
-      form.submit();
-      setTimeout(() => finish(true), 2500);
+  async function postToBackend(fields) {
+    if (!backendConfigured()) throw new Error('Form backend is not configured.');
+
+    const response = await fetch(FORMS_API_URL, {
+      method: 'POST',
+      headers: { 'Accept': 'application/json' },
+      body: fields.formData || (() => {
+        const fd = new FormData();
+        Object.entries(fields).forEach(([key, value]) => {
+          if (key !== 'formData') fd.append(key, value == null ? '' : value);
+        });
+        return fd;
+      })()
     });
+
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+
+    if (!response.ok) {
+      throw new Error(data.errors?.map(e => e.message).join(', ') || 'Form submission failed.');
+    }
+    return data;
   }
 
   const AGENT_PASSWORD = "DEVLOGIN123";
@@ -548,7 +543,6 @@
     const nameInput = document.getElementById('apName');
     const emailInput = document.getElementById('apEmail');
     const err = document.getElementById('approvedError');
-    const success = document.getElementById('approvedSuccess');
     const name = nameInput.value.trim().toLowerCase();
     const email = emailInput.value.trim().toLowerCase();
 
@@ -558,35 +552,8 @@
       return;
     }
 
-    btn.disabled = true;
-    btn.textContent = 'Checking...';
-
-    try {
-      const response = await jsonp('checkApproved', { name, email });
-      if (!response || !response.ok || !response.record) {
-        err.textContent = 'No approved access found for that name and Gmail.';
-        return;
-      }
-
-      const match = response.record;
-      const now = new Date();
-      const expires = match.expiresAt ? new Date(match.expiresAt) : null;
-      if (expires && now > expires) {
-        err.textContent = 'Your access expired. Contact Muntazir to renew.';
-        return;
-      }
-
-      const expiryStr = expires ? expires.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '';
-      window.__accessExpiryLabel = expiryStr;
-      document.getElementById('lockScreen').style.display = 'none';
-      document.getElementById('studio').style.display = 'block';
-      showExpiryBanner(expiryStr);
-    } catch (e) {
-      err.textContent = e.message || 'Something went wrong checking access — try again.';
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Enter';
-    }
+    err.textContent = 'Approval is managed from your Formspree submissions. This login requires a separate access database.';
+    btn.disabled = false;
   }
 
   function showExpiryBanner(expiryStr) {
@@ -648,31 +615,36 @@
     const btn = document.querySelector('#reqForm .pay-request-btn');
     const nameInput = document.getElementById('reqName');
     const emailInput = document.getElementById('reqEmail');
+    const screenshotInput = document.getElementById('reqScreenshot');
     const err = document.getElementById('reqError');
     const success = document.getElementById('reqSuccess');
-    const preview = document.getElementById('reqScreenshotPreview');
     const name = nameInput.value.trim();
     const email = emailInput.value.trim();
-    const emailPattern = /^[^\s@]+@gmail\.com$/i;
-    const screenshot = preview.dataset.value || '';
+    const screenshot = screenshotInput.files[0];
 
     err.textContent = '';
+
     if (!name) {
       err.textContent = 'Enter your name.';
       nameInput.focus();
       return;
     }
-    if (!emailPattern.test(email)) {
+
+    if (!/^[^\s@]+@gmail\.com$/i.test(email)) {
       err.textContent = 'Enter a valid Gmail address.';
       emailInput.focus();
       return;
     }
+
     if (!screenshot) {
       err.textContent = 'Attach a screenshot of your payment.';
+      screenshotInput.focus();
       return;
     }
-    if (!backendConfigured()) {
-      err.textContent = 'Form backend is not configured yet. Ask the site owner to finish the setup.';
+
+    const maxSize = 10 * 1024 * 1024;
+    if (screenshot.size > maxSize) {
+      err.textContent = 'Screenshot must be smaller than 10 MB.';
       return;
     }
 
@@ -680,20 +652,21 @@
     btn.textContent = 'Sending...';
 
     try {
-      const recordKey = 'access-request:' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-      await postToBackend({
-        action: 'createRequest',
-        key: recordKey,
-        name,
-        email,
-        screenshot
-      });
+      const fd = new FormData();
+      fd.append('name', name);
+      fd.append('email', email);
+      fd.append('payment_screenshot', screenshot);
+      fd.append('subject', 'New Payment Access Request');
+      fd.append('form_source', 'Muntazir AI Agent — GitHub Pages');
+      fd.append('requested_at', new Date().toISOString());
+
+      await postToBackend({ formData: fd });
 
       document.getElementById('reqForm').style.display = 'none';
-      success.textContent = 'Sent successfully — your payment request is now pending review.';
+      success.textContent = 'Sent successfully — your payment request has been submitted for review.';
       success.style.display = 'block';
     } catch (e) {
-      err.textContent = 'Could not send your request. Check the backend setup and try again.';
+      err.textContent = e.message || 'Could not send your request. Please try again.';
       btn.disabled = false;
       btn.textContent = 'Request access';
     }
@@ -1016,81 +989,16 @@ Produce exactly 3-4 trending_now entries, each a genuinely different pattern. Th
   // ---------- ADMIN TAB ----------
   async function loadRequests() {
     const output = document.getElementById('adminOutput');
-    output.innerHTML = '<div class="empty-note">Loading requests...</div>';
-
-    try {
-      const response = await jsonp('listRequests', { adminKey: FORMS_ADMIN_KEY });
-      if (!response || !response.ok) throw new Error('Not authorized');
-
-      const records = response.records || [];
-      if (records.length === 0) {
-        output.innerHTML = '<div class="empty-note">No requests yet.</div>';
-        return;
-      }
-
-      output.innerHTML = '';
-      records.forEach(rec => {
-        const card = document.createElement('div');
-        card.className = 'admin-card';
-        const when = rec.requestedAt ? new Date(rec.requestedAt).toLocaleString() : '';
-        card.innerHTML = `
-          <div class="admin-card-top">
-            <span class="admin-card-name"></span>
-            <span class="admin-status admin-status-${rec.status}"></span>
-          </div>
-          <div class="admin-card-email"></div>
-          <div class="admin-card-time"></div>
-          <img class="admin-card-screenshot" style="display:none;">
-          <div class="admin-card-actions"></div>
-        `;
-        card.querySelector('.admin-card-name').textContent = rec.name || '(no name)';
-        card.querySelector('.admin-status').textContent = rec.status || 'pending';
-        card.querySelector('.admin-card-email').textContent = rec.email || '';
-        card.querySelector('.admin-card-time').textContent = when;
-        if (rec.status === 'approved' && rec.expiresAt) {
-          const expiryStr = new Date(rec.expiresAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-          card.querySelector('.admin-card-time').textContent += ' · access until ' + expiryStr;
-        }
-        if (rec.screenshot) {
-          const shot = card.querySelector('.admin-card-screenshot');
-          shot.src = rec.screenshot;
-          shot.style.display = 'block';
-        }
-
-        const actions = card.querySelector('.admin-card-actions');
-        if (rec.status === 'pending') {
-          const approveBtn = document.createElement('button');
-          approveBtn.className = 'admin-btn admin-approve';
-          approveBtn.textContent = 'Approve';
-          approveBtn.onclick = () => updateRequestStatus(rec.key, 'approved');
-
-          const banBtn = document.createElement('button');
-          banBtn.className = 'admin-btn admin-ban';
-          banBtn.textContent = 'Ban';
-          banBtn.onclick = () => updateRequestStatus(rec.key, 'banned');
-
-          actions.appendChild(approveBtn);
-          actions.appendChild(banBtn);
-        }
-        output.appendChild(card);
-      });
-    } catch (e) {
-      output.innerHTML = '<div class="error-line">Could not load requests — check your forms backend configuration.</div>';
-    }
+    output.innerHTML = `
+      <div class="empty-note">
+        Form submissions are sent securely to your Formspree inbox.
+        <br><br>
+        <a href="https://formspree.io/forms/mqpzgdya/submissions" target="_blank" rel="noopener">Open Formspree submissions</a>
+      </div>`;
   }
 
   async function updateRequestStatus(key, status) {
-    try {
-      await postToBackend({
-        action: 'updateStatus',
-        key,
-        status,
-        adminKey: FORMS_ADMIN_KEY
-      });
-      setTimeout(loadRequests, 700);
-    } catch (e) {
-      alert('Could not update this request — check the forms backend.');
-    }
+    alert('With Formspree, submissions are reviewed from your Formspree dashboard. Approve/Ban is not stored by Formspree as an access database.');
   }
 </script>
 </body>
