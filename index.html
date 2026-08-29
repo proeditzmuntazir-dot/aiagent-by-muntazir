@@ -469,8 +469,38 @@
 
 <script>
   // ---------- GITHUB / FORMS BACKEND ----------
-  // Replace this with your deployed Google Apps Script Web App URL.
+  // Formspree receives the original submission.
   const FORMS_API_URL = 'https://formspree.io/f/mqpzgdya';
+
+  // ---------- ACCESS REQUEST DATABASE ----------
+  // Create a free Supabase project, run supabase_setup.sql, then paste these two values.
+  const SUPABASE_URL = 'PASTE_YOUR_SUPABASE_PROJECT_URL_HERE';
+  const SUPABASE_ANON_KEY = 'PASTE_YOUR_SUPABASE_ANON_KEY_HERE';
+  // This key is checked by the database RPC for admin request management.
+  // IMPORTANT: because this is a static GitHub Pages site, this is not a secret.
+  const ADMIN_DB_KEY = 'CHANGE_THIS_ADMIN_DB_KEY';
+
+  function supabaseConfigured() {
+    return SUPABASE_URL.startsWith('https://') &&
+      !SUPABASE_URL.includes('PASTE_YOUR_') &&
+      !SUPABASE_ANON_KEY.includes('PASTE_YOUR_');
+  }
+
+  async function supabaseRpc(fn, args) {
+    if (!supabaseConfigured()) throw new Error('Supabase is not configured.');
+    const r = await fetch(SUPABASE_URL + '/rest/v1/rpc/' + fn, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: 'Bearer ' + SUPABASE_ANON_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(args || {})
+    });
+    const data = await r.json().catch(() => null);
+    if (!r.ok) throw new Error(data?.message || data?.hint || 'Database request failed.');
+    return data;
+  }
 
   function backendConfigured() {
     return FORMS_API_URL === 'https://formspree.io/f/mqpzgdya';
@@ -543,17 +573,29 @@
     const nameInput = document.getElementById('apName');
     const emailInput = document.getElementById('apEmail');
     const err = document.getElementById('approvedError');
-    const name = nameInput.value.trim().toLowerCase();
-    const email = emailInput.value.trim().toLowerCase();
-
+    const success = document.getElementById('approvedSuccess');
+    const name = nameInput.value.trim();
+    const email = emailInput.value.trim();
     err.textContent = '';
-    if (!name || !email) {
-      err.textContent = 'Enter both your name and Gmail.';
-      return;
-    }
-
-    err.textContent = 'Approval is managed from your Formspree submissions. This login requires a separate access database.';
-    btn.disabled = false;
+    success.style.display = 'none';
+    if (!name || !email) { err.textContent = 'Enter both your name and Gmail.'; return; }
+    if (!supabaseConfigured()) { err.textContent = 'Access database is not configured yet.'; return; }
+    btn.disabled = true; btn.textContent = 'Checking...';
+    try {
+      const rec = await supabaseRpc('check_access_request', { p_name: name, p_email: email });
+      if (!rec || rec.status !== 'approved') {
+        err.textContent = rec?.status === 'banned' ? 'This account has been banned.' : 'No approved access found for this name and Gmail.';
+        return;
+      }
+      const expires = rec.expires_at ? new Date(rec.expires_at) : null;
+      if (expires && new Date() > expires) { err.textContent = 'Your access has expired. Please request access again.'; return; }
+      const expiryStr = expires ? expires.toLocaleDateString(undefined, {year:'numeric', month:'short', day:'numeric'}) : '';
+      document.getElementById('lockScreen').style.display = 'none';
+      document.getElementById('studio').style.display = 'block';
+      showExpiryBanner(expiryStr);
+    } catch (e) {
+      err.textContent = e.message || 'Could not check access.';
+    } finally { btn.disabled = false; btn.textContent = 'Enter'; }
   }
 
   function showExpiryBanner(expiryStr) {
@@ -627,24 +669,34 @@
     if (!/^[^\s@]+@gmail\.com$/i.test(email)) { err.textContent = 'Enter a valid Gmail address.'; emailInput.focus(); return; }
     if (!screenshot) { err.textContent = 'Attach a screenshot of your payment.'; screenshotInput.focus(); return; }
     if (screenshot.size > 10 * 1024 * 1024) { err.textContent = 'Screenshot must be smaller than 10 MB.'; return; }
+    if (!supabaseConfigured()) { err.textContent = 'The access database is not configured yet.'; return; }
     btn.disabled = true; btn.textContent = 'Sending...';
     try {
+      // Keep Formspree as the email/inbox submission.
       const data = new FormData(form);
       data.set('name', name); data.set('email', email); data.set('payment_screenshot', screenshot);
       data.set('subject', 'New Payment Access Request');
       data.set('requested_at', new Date().toISOString());
-      const response = await fetch(form.action, { method: 'POST', body: data, headers: { Accept: 'application/json' } });
+      const response = await fetch(form.action, { method:'POST', body:data, headers:{Accept:'application/json'} });
       if (!response.ok) {
-        let message = 'Could not send your request.';
-        try { const result = await response.json(); if (result.errors) message = result.errors.map(e => e.message).join(', '); } catch (_) {}
+        let message='Could not send the Formspree submission.';
+        try { const result=await response.json(); if(result.errors) message=result.errors.map(e=>e.message).join(', '); } catch(_){}
         throw new Error(message);
       }
-      form.style.display = 'none';
-      success.textContent = 'Sent successfully — your payment request has been submitted for review.';
-      success.style.display = 'block';
-    } catch (e) {
-      err.textContent = e.message || 'Could not send your request. Please try again.';
-      btn.disabled = false; btn.textContent = 'Request access';
+
+      // Save the request in the site's database so Admin can approve/ban it.
+      const preview = document.getElementById('reqScreenshotPreview');
+      const screenshotData = preview.dataset.value || '';
+      await supabaseRpc('create_access_request', {
+        p_name: name, p_email: email, p_screenshot: screenshotData
+      });
+
+      form.style.display='none';
+      success.textContent='Sent successfully — your payment request is now pending admin review.';
+      success.style.display='block';
+    } catch(e) {
+      err.textContent=e.message || 'Could not send your request. Please try again.';
+      btn.disabled=false; btn.textContent='Request access';
     }
   }
 
@@ -964,20 +1016,41 @@ Produce exactly 3-4 trending_now entries, each a genuinely different pattern. Th
 
   // ---------- ADMIN TAB ----------
   async function loadRequests() {
-    const output = document.getElementById('adminOutput');
-    output.innerHTML = `
-      <div class="empty-note">
-        <b>Payment submission requests</b><br><br>
-        New Name, Gmail and payment screenshots are submitted to Formspree.
-        <br><br>
-        <a href="https://formspree.io/forms/mqpzgdya/submissions" target="_blank" rel="noopener">Open Formspree submissions</a>
-        <br><br>
-        <strong>Approve / Ban inside this Admin tab</strong> requires a database connected to the submissions.
-      </div>`;
+    const output=document.getElementById('adminOutput');
+    output.innerHTML='<div class="empty-note">Loading requests...</div>';
+    if(!supabaseConfigured()){ output.innerHTML='<div class="error-line">Connect Supabase first. Then refresh this tab.</div>'; return; }
+    try {
+      const records=await supabaseRpc('admin_list_access_requests',{p_admin_key:ADMIN_DB_KEY});
+      if(!records || records.length===0){ output.innerHTML='<div class="empty-note">No requests yet.</div>'; return; }
+      output.innerHTML='';
+      records.forEach(rec=>{
+        const card=document.createElement('div'); card.className='admin-card';
+        const when=rec.requested_at?new Date(rec.requested_at).toLocaleString():'';
+        card.innerHTML=`<div class="admin-card-top"><span class="admin-card-name"></span><span class="admin-status"></span></div><div class="admin-card-email"></div><div class="admin-card-time"></div><img class="admin-card-screenshot" style="display:none;max-width:100%;margin-top:10px;border-radius:8px;"><div class="admin-card-actions"></div>`;
+        card.querySelector('.admin-card-name').textContent=rec.name||'(no name)';
+        card.querySelector('.admin-status').textContent=rec.status||'pending';
+        card.querySelector('.admin-status').className='admin-status admin-status-'+(rec.status||'pending');
+        card.querySelector('.admin-card-email').textContent=rec.email||'';
+        card.querySelector('.admin-card-time').textContent=when+(rec.status==='approved'&&rec.expires_at?' · access until '+new Date(rec.expires_at).toLocaleDateString():'');
+        if(rec.screenshot){const img=card.querySelector('.admin-card-screenshot');img.src=rec.screenshot;img.style.display='block';}
+        const actions=card.querySelector('.admin-card-actions');
+        if(rec.status==='pending'){
+          const a=document.createElement('button');a.className='admin-btn admin-approve';a.textContent='Approve';a.onclick=()=>updateRequestStatus(rec.id,'approved');
+          const b=document.createElement('button');b.className='admin-btn admin-ban';b.textContent='Ban';b.onclick=()=>updateRequestStatus(rec.id,'banned');
+          actions.append(a,b);
+        } else {
+          const label=document.createElement('span'); label.textContent='Status: '+rec.status; actions.appendChild(label);
+        }
+        output.appendChild(card);
+      });
+    } catch(e){ output.innerHTML='<div class="error-line">'+(e.message||'Could not load requests.')+'</div>'; }
   }
 
-  async function updateRequestStatus(key, status) {
-    alert('Approve/Ban requires a persistent access database. Formspree stores the submission but does not provide the site database needed to change user access.');
+  async function updateRequestStatus(id, status) {
+    try {
+      await supabaseRpc('admin_update_access_request',{p_admin_key:ADMIN_DB_KEY,p_id:id,p_status:status});
+      await loadRequests();
+    } catch(e) { alert(e.message || 'Could not update this request.'); }
   }
 
 </script>
